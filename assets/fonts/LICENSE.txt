@@ -1,0 +1,23 @@
+Font licensing for rclc website
+================================
+
+All three families are licensed under the SIL Open Font License, Version 1.1,
+which permits use, embedding and self-hosting on commercial websites at no cost.
+Full licence text for each family is in the OFL-*.txt files in this folder.
+
+1. Cormorant Garamond  (c) 2015 the Cormorant Project Authors
+   Files: cormorant-garamond-500-normal.woff2, cormorant-garamond-500-italic.woff2
+   Latin subset. No Reserved Font Name, so subsetting is permitted.
+
+2. Outfit              (c) 2021 The Outfit Project Authors
+   File:  outfit-300-600-normal.woff2
+   Latin subset. No Reserved Font Name, so subsetting is permitted.
+
+3. Mrs Saint Delafield (c) 2011 Alejandro Paul, Reserved Font Name "Mrs Saint Delafield"
+   File:  MrsSaintDelafield-Regular.ttf
+   Served unmodified (not subset or converted), because a modified version
+   may not use the Reserved Font Name.
+
+Icons: all icons are hand-written inline SVG in index.html, owned by the site.
+Social glyphs (Facebook, X, Instagram, LinkedIn) are used only to link to the
+firm's own profiles, as each platform's brand guidelines allow.
