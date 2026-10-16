@@ -40,7 +40,7 @@
 
   /* ---------- header, back-to-top ---------- */
   const header = $("#header");
-  const hero = $(".hero");
+  const hero = $(".hero, .page-hero");   // home has the film hero, inner pages a page header
   const toTop = $("#toTop");
   const onScroll = () => {
     const y = window.scrollY;
@@ -78,16 +78,6 @@
       }).observe(hero);
     }
   }
-
-  /* ---------- active nav link ---------- */
-  const links = $$(".main-nav > a");
-  const spy = new IntersectionObserver((entries) => {
-    entries.forEach((en) => {
-      if (!en.isIntersecting) return;
-      links.forEach((a) => a.classList.toggle("active", a.hash === "#" + en.target.id));
-    });
-  }, { rootMargin: "-45% 0px -50% 0px" });
-  links.forEach((a) => { const s = $(a.hash); if (s) spy.observe(s); });
 
   /* ---------- count-up numbers ---------- */
   const counter = new IntersectionObserver((entries) => {
@@ -130,12 +120,20 @@
     });
   });
   $$("[data-pa]").forEach((a) => a.addEventListener("click", () => activate(parseInt(a.dataset.pa, 10))));
+  // deep links such as practice-areas.html#pa-4 open that area on the stage
+  const fromHash = () => {
+    const m = /^#pa-(\d)$/.exec(location.hash);
+    if (m && tabs.length) activate(parseInt(m[1], 10) - 1);
+  };
+  fromHash();
+  addEventListener("hashchange", fromHash);
 
   /* ---------- engagement audience switch ---------- */
   const plans = $("#plans");
   const sw = $(".switch");
   const audBtns = $$("[data-aud-btn]");
   const setAud = (aud) => {
+    if (!plans) return;
     sw.setAttribute("aria-checked", String(aud === "ind"));
     sw.setAttribute("aria-label", aud === "ind" ? "Show options for businesses" : "Show options for individuals");
     audBtns.forEach((b) => b.classList.toggle("on", b.dataset.audBtn === aud));
@@ -149,12 +147,12 @@
       plans.classList.remove("is-swapping");
     }, 350);
   };
-  sw.addEventListener("click", () => setAud(sw.getAttribute("aria-checked") === "true" ? "biz" : "ind"));
+  if (sw) sw.addEventListener("click", () => setAud(sw.getAttribute("aria-checked") === "true" ? "biz" : "ind"));
   audBtns.forEach((b) => b.addEventListener("click", () => setAud(b.dataset.audBtn)));
 
   /* ---------- vision band parallax (transform only, clamped) ---------- */
   const vision = $(".vision");
-  if (!reduceMotion) {
+  if (vision && !reduceMotion) {
     const parallax = () => {
       const r = vision.getBoundingClientRect();
       if (r.bottom < 0 || r.top > innerHeight) return;
@@ -173,7 +171,7 @@
     note.classList.toggle("is-error", isError);
     note.hidden = false;
   };
-  form.addEventListener("submit", (e) => {
+  if (form) form.addEventListener("submit", (e) => {
     e.preventDefault();
     const d = Object.fromEntries(new FormData(form));
     const missing = ["name", "email", "message"].find((k) => !String(d[k] || "").trim());

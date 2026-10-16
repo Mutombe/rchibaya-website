@@ -131,7 +131,12 @@ def static_checks(pages):
                 if ref != "#" and ref[1:] not in c.ids: bad.append(f"{page_path.name}: {tag}[{attr}] -> {ref} (no such id)")
                 continue
             target = (page_path.parent / urllib.parse.unquote(ref.split("#")[0].split("?")[0])).resolve()
-            if not target.exists(): bad.append(f"{page_path.name}: {tag}[{attr}] -> {ref} (missing file)")
+            if not target.exists():
+                bad.append(f"{page_path.name}: {tag}[{attr}] -> {ref} (missing file)")
+            elif "#" in ref and target.suffix == ".html":
+                frag = ref.split("#", 1)[1]
+                tc = Collector(); tc.feed(target.read_text(encoding="utf-8"))
+                if frag and frag not in tc.ids: bad.append(f"{page_path.name}: {ref} (no #{frag} in {target.name})")
     report("Every internal link and asset path resolves", not bad, "\n".join(bad) or f"{len(pages)} page(s) walked")
 
     bad, n = [], 0
@@ -198,178 +203,181 @@ def static_checks(pages):
            "\n".join(probs) or f"{len(font_files)} font files, all SIL OFL 1.1; icons are inline SVG")
 
 # ---------------------------------------------------------------- browser checks
-def browser_checks(base, shots):
+def browser_checks(base, shots, names):
+    urls = [(n, base + ("" if n == "index.html" else n)) for n in names]
     with sync_playwright() as p:
         browser = p.chromium.launch()
 
         # 1 + 2: console, requests, horizontal overflow
         errs, overflow = [], []
-        for w, h in [(1280, 800), (390, 844)]:
-            ctx, page = new_page(browser, w, h)
-            page.on("console", lambda m, w=w: m.type == "error" and errs.append(f"{w}px console: {m.text[:160]}"))
-            page.on("pageerror", lambda e, w=w: errs.append(f"{w}px pageerror: {e}"))
-            page.on("requestfailed", lambda r, w=w: errs.append(f"{w}px failed: {r.url[:120]} {r.failure}"))
-            page.on("response", lambda r, w=w: r.status >= 400 and errs.append(f"{w}px HTTP {r.status}: {r.url[:120]}"))
-            page.goto(base, wait_until="load")
-            settle(page)
-            page.wait_for_timeout(3000)  # map iframe streams tiles, so never truly idle
-            sw, cw = page.evaluate("[document.documentElement.scrollWidth, document.documentElement.clientWidth]")
-            if sw != cw:
-                wide = page.evaluate("""() => [...document.querySelectorAll('body *')].filter(e => e.getBoundingClientRect().right > document.documentElement.clientWidth + 1)
-                     .slice(0, 6).map(e => e.tagName + '.' + (e.className.baseVal ?? e.className) + ' right=' + Math.round(e.getBoundingClientRect().right))""")
-                overflow.append(f"{w}px: scrollWidth {sw} != clientWidth {cw}; {wide}")
-            else:
-                overflow.append(f"{w}px: {sw} == {cw}")
-            ext = page.evaluate("performance.getEntriesByType('resource').map(r => r.name).filter(n => /fonts\\.(googleapis|gstatic)/.test(n))")
-            if ext: errs.append(f"{w}px: external font requests {ext}")
-            ctx.close()
-        report("Zero console errors, zero failed requests", not errs, "\n".join(errs))
-        report("scrollWidth === clientWidth at 1280 and at 390", all("==" in o for o in overflow), "\n".join(overflow))
+        for name, url in urls:
+            for w, h in [(1280, 800), (390, 844)]:
+                ctx, page = new_page(browser, w, h)
+                tag = f"{name} {w}px"
+                page.on("console", lambda m, t=tag: m.type == "error" and errs.append(f"{t} console: {m.text[:160]}"))
+                page.on("pageerror", lambda e, t=tag: errs.append(f"{t} pageerror: {e}"))
+                page.on("requestfailed", lambda r, t=tag: errs.append(f"{t} failed: {r.url[:120]} {r.failure}"))
+                page.on("response", lambda r, t=tag: r.status >= 400 and errs.append(f"{t} HTTP {r.status}: {r.url[:120]}"))
+                page.goto(url, wait_until="load")
+                settle(page)
+                page.wait_for_timeout(3000 if "contact" in name or name == "index.html" else 300)  # let the map iframe finish before closing
+                sw, cw = page.evaluate("[document.documentElement.scrollWidth, document.documentElement.clientWidth]")
+                if sw != cw:
+                    wide = page.evaluate("""() => [...document.querySelectorAll('body *')].filter(e => e.getBoundingClientRect().right > document.documentElement.clientWidth + 1)
+                         .slice(0, 6).map(e => e.tagName + '.' + (e.className.baseVal ?? e.className) + ' right=' + Math.round(e.getBoundingClientRect().right))""")
+                    overflow.append(f"{tag}: scrollWidth {sw} != clientWidth {cw}; {wide}")
+                ext = page.evaluate("performance.getEntriesByType('resource').map(r => r.name).filter(n => /fonts\\.(googleapis|gstatic)/.test(n))")
+                if ext: errs.append(f"{tag}: external font requests {ext}")
+                ctx.close()
+        report("Zero console errors, zero failed requests, on every page", not errs, "\n".join(errs) or f"{len(urls)} pages x 2 viewports")
+        report("scrollWidth === clientWidth at 1280 and at 390", not overflow, "\n".join(overflow) or f"{len(urls)} pages x 2 viewports, no overflow")
 
-        # 5: hero fits one screen
-        probs, ok_list = [], []
-        for w, h in HERO_VIEWPORTS:
-            ctx, page = new_page(browser, w, h)
-            page.goto(base, wait_until="load")
-            page.wait_for_timeout(1600)
-            r = page.evaluate("""() => {
-              const hero = document.querySelector('.hero'), hb = hero.getBoundingClientRect();
-              const head = document.querySelector('.site-header').getBoundingClientRect();
-              let lowest = 0, highest = 1e9, culprit = '';
-              hero.querySelectorAll('.hero-grid *').forEach(e => {
-                if (!__visible(e) || e.closest('svg')) return;
-                const r = e.getBoundingClientRect();
-                if (r.bottom > lowest) { lowest = r.bottom; culprit = e.className.baseVal ?? e.className; }
-                if (r.top < highest) highest = r.top;
-              });
-              return { vh: innerHeight, heroBottom: hb.bottom, heroTop: hb.top, contentBottom: lowest, contentTop: highest, headerBottom: head.bottom, culprit,
-                       // the background photo's slow zoom overflows by design and is clipped, so only
-                       // overflow from real content (outside .hero-bg) counts as clipping
-                       clipped: [...hero.querySelectorAll('.hero-grid *')].some(e => __visible(e) && !e.closest('svg') && e.getBoundingClientRect().bottom > hb.bottom + 1) };
-            }""")
-            fits = r["heroBottom"] <= r["vh"] + 1 and r["contentBottom"] <= r["heroBottom"] + 1 and r["contentTop"] >= r["headerBottom"] - 1 and not r["clipped"]
-            line = f"{w}x{h}: hero {r['heroTop']:.0f}-{r['heroBottom']:.0f} of {r['vh']}, content {r['contentTop']:.0f}-{r['contentBottom']:.0f}, header ends {r['headerBottom']:.0f}"
-            (ok_list if fits else probs).append(line + ("" if fits else f"  <- {r['culprit']}"))
-            if shots: page.screenshot(path=str(Path(shots) / f"hero-{w}x{h}.png"))
-            ctx.close()
-        report("The hero fits one screen at six real viewport sizes", not probs, "\n".join(probs + ok_list))
+        # 5: hero (home) and page header (inner pages) fit one screen
+        probs, ok_n = [], 0
+        for name, url in urls:
+            for w, h in HERO_VIEWPORTS:
+                ctx, page = new_page(browser, w, h)
+                page.goto(url, wait_until="load")
+                page.wait_for_timeout(1500)
+                r = page.evaluate("""() => {
+                  const hero = document.querySelector('.hero, .page-hero'), hb = hero.getBoundingClientRect();
+                  const head = document.querySelector('.site-header').getBoundingClientRect();
+                  const kids = [...hero.querySelectorAll('.container *')].filter(e => __visible(e) && !e.closest('svg'));
+                  let lowest = 0, highest = 1e9, culprit = '';
+                  kids.forEach(e => { const r = e.getBoundingClientRect();
+                    if (r.bottom > lowest) { lowest = r.bottom; culprit = e.className.baseVal ?? e.className; }
+                    if (r.top < highest) highest = r.top; });
+                  return { vh: innerHeight, heroBottom: hb.bottom, contentBottom: lowest, contentTop: highest, headerBottom: head.bottom, culprit };
+                }""")
+                fits = r["heroBottom"] <= r["vh"] + 1 and r["contentBottom"] <= r["heroBottom"] + 1 and r["contentTop"] >= r["headerBottom"] - 1
+                if fits: ok_n += 1
+                else: probs.append(f"{name} {w}x{h}: header ends {r['headerBottom']:.0f}, content {r['contentTop']:.0f}-{r['contentBottom']:.0f}, hero ends {r['heroBottom']:.0f} of {r['vh']}  <- {r['culprit']}")
+                if shots and w in (1440, 390): page.screenshot(path=str(Path(shots) / f"top-{name[:-5]}-{w}.png"))
+                ctx.close()
+        report("The hero fits one screen at six real viewport sizes, on every page", not probs, "\n".join(probs) or f"{ok_n} page/viewport combinations fit")
 
         # 6 + 7: line budgets
-        data = {}
-        for w, h in [(1280, 800), (390, 844)]:
-            ctx, page = new_page(browser, w, h)
-            page.goto(base, wait_until="load")
-            settle(page, 1800)
-            data[w] = {d["i"]: d for d in page.evaluate(TEXT_BLOCKS_JS)}
-            if w == 390:
-                paras = page.evaluate("""() => [...document.querySelectorAll('p, li, blockquote, dd, figcaption')]
-                    .filter(e => __visible(e) && !e.closest('[aria-hidden="true"]'))
-                    .map(e => ({ text: e.textContent.trim().replace(/\\s+/g,' ').slice(0, 60), lines: __lines(e) }))""")
-            ctx.close()
-        wraps = [f"{d['tag']}.{d['cls']} '{d['text']}': 1 line at 1280, {data[390][i]['lines']} at 390"
-                 for i, d in data[1280].items() if i in data[390] and d["lines"] == 1 and data[390][i]["lines"] > 1]
-        report("No text is one line on desktop and two on mobile, except headings", not wraps,
-               "\n".join(wraps) or f"{len([i for i in data[1280] if i in data[390]])} text blocks compared")
-        long = [f"{p_['lines']} lines: '{p_['text']}'" for p_ in paras if p_["lines"] > 4]
-        report("No paragraph exceeds four lines at 390px", not long,
-               "\n".join(long) or f"{len(paras)} paragraphs, max {max(p_['lines'] for p_ in paras)} lines")
+        wraps, long, n_blocks, n_paras, max_lines = [], [], 0, 0, 0
+        for name, url in urls:
+            data, paras = {}, []
+            for w, h in [(1280, 800), (390, 844)]:
+                ctx, page = new_page(browser, w, h)
+                page.goto(url, wait_until="load")
+                settle(page, 1500)
+                data[w] = {d["i"]: d for d in page.evaluate(TEXT_BLOCKS_JS)}
+                if w == 390:
+                    paras = page.evaluate("""() => [...document.querySelectorAll('p, li, blockquote, dd, figcaption')]
+                        .filter(e => __visible(e) && !e.closest('[aria-hidden="true"]'))
+                        .map(e => ({ text: e.textContent.trim().replace(/\\s+/g,' ').slice(0, 60), lines: __lines(e) }))""")
+                ctx.close()
+            common = [i for i in data[1280] if i in data[390]]
+            n_blocks += len(common)
+            wraps += [f"{name}: {data[1280][i]['tag']}.{data[1280][i]['cls']} '{data[1280][i]['text']}': 1 line at 1280, {data[390][i]['lines']} at 390"
+                      for i in common if data[1280][i]["lines"] == 1 and data[390][i]["lines"] > 1]
+            long += [f"{name}: {q['lines']} lines: '{q['text']}'" for q in paras if q["lines"] > 4]
+            n_paras += len(paras); max_lines = max([max_lines] + [q["lines"] for q in paras])
+        report("No text is one line on desktop and two on mobile, except headings", not wraps, "\n".join(wraps) or f"{n_blocks} text blocks compared across {len(urls)} pages")
+        report("No paragraph exceeds four lines at 390px", not long, "\n".join(long) or f"{n_paras} paragraphs across {len(urls)} pages, max {max_lines} lines")
 
         # 9: image aspect ratios
-        bad = []
-        for w, h in [(1280, 800), (390, 844)]:
-            ctx, page = new_page(browser, w, h)
-            page.goto(base, wait_until="load")
-            settle(page)
-            res = page.evaluate("""() => [...document.images].filter(i => i.complete && i.naturalWidth && __visible(i)).map(i => {
-                const cs = getComputedStyle(i), r = i.getBoundingClientRect();
-                return { src: i.getAttribute('src'), fit: cs.objectFit, box: r.width / r.height, nat: i.naturalWidth / i.naturalHeight,
-                         attr: i.getAttribute('width') / i.getAttribute('height'), n: 1 };
-            })""")
-            for im in res:
-                if im["fit"] in ("fill", "scale-down", "none") and abs(im["box"] / im["nat"] - 1) > 0.015:
-                    bad.append(f"{w}px {im['src']}: drawn {im['box']:.3f} vs natural {im['nat']:.3f} (object-fit {im['fit']})")
-                if im["attr"] and abs(im["attr"] / im["nat"] - 1) > 0.01:
-                    bad.append(f"{w}px {im['src']}: width/height attributes {im['attr']:.3f} vs natural {im['nat']:.3f}")
-            ctx.close()
+        bad, n_img = [], 0
+        for name, url in urls:
+            for w, h in [(1280, 800), (390, 844)]:
+                ctx, page = new_page(browser, w, h)
+                page.goto(url, wait_until="load")
+                settle(page)
+                res = page.evaluate("""() => [...document.images].filter(i => i.complete && i.naturalWidth && __visible(i)).map(i => {
+                    const cs = getComputedStyle(i), r = i.getBoundingClientRect();
+                    return { src: i.getAttribute('src'), fit: cs.objectFit, box: r.width / r.height, nat: i.naturalWidth / i.naturalHeight,
+                             attr: i.getAttribute('width') / i.getAttribute('height') };
+                })""")
+                n_img += len(res)
+                for im in res:
+                    if im["fit"] in ("fill", "scale-down", "none") and abs(im["box"] / im["nat"] - 1) > 0.015:
+                        bad.append(f"{name} {w}px {im['src']}: drawn {im['box']:.3f} vs natural {im['nat']:.3f} (object-fit {im['fit']})")
+                    if im["attr"] and abs(im["attr"] / im["nat"] - 1) > 0.01:
+                        bad.append(f"{name} {im['src']}: width/height attributes {im['attr']:.3f} vs natural {im['nat']:.3f}")
+                ctx.close()
         report("Images are not stretched: rendered aspect ratio equals natural ratio", not bad,
-               "\n".join(sorted(set(bad))) or f"{len(res)} images checked per viewport (cover/contain crop, never distort)")
+               "\n".join(sorted(set(bad))) or f"{n_img} image renders checked (cover/contain crop, never distort)")
 
         # 10: no JavaScript
         probs = []
-        for w, h in [(1280, 800), (390, 844)]:
-            ctx, page = new_page(browser, w, h, js=False)
-            page.goto(base, wait_until="load")
-            page.add_script_tag(content="void 0") if False else None
-            r = page.evaluate("""() => {
-              const vis = (e) => { const cs = getComputedStyle(e), r = e.getBoundingClientRect();
-                                   return cs.display !== 'none' && cs.visibility !== 'hidden' && +cs.opacity > 0.01 && r.width > 0 && r.height > 0; };
-              const hidden = [...document.querySelectorAll('main *, footer *, header *')].filter(e =>
-                 +getComputedStyle(e).opacity < 0.01 && !e.closest('.to-top') && e.getBoundingClientRect().width > 0).map(e => e.className).slice(0, 5);
-              return { htmlClass: document.documentElement.className,
-                       panels: [...document.querySelectorAll('.pa')].filter(vis).length,
-                       navLinks: [...document.querySelectorAll('.main-nav a')].filter(e => vis(e) && e.getBoundingClientRect().left < innerWidth).length,
-                       faq: document.querySelectorAll('details.faq-item').length,
-                       hidden, overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth };
-            }""")
-            if r["htmlClass"] != "no-js": probs.append(f"{w}px: html class is '{r['htmlClass']}'")
-            if r["panels"] != 9: probs.append(f"{w}px: only {r['panels']}/9 practice areas visible")
-            if r["navLinks"] != 6: probs.append(f"{w}px: only {r['navLinks']}/6 nav links reachable")
-            if r["hidden"]: probs.append(f"{w}px: invisible content {r['hidden']}")
-            if r["overflow"]: probs.append(f"{w}px: horizontal overflow {r['overflow']}px")
-            if shots: page.screenshot(path=str(Path(shots) / f"nojs-{w}.png"), full_page=True)
-            ctx.close()
-        report("The page renders fully with JavaScript disabled", not probs, "\n".join(probs) or "9/9 practice areas, 6/6 nav links, FAQ via <details>, no hidden content")
-
-        # 11: mobile navigation
-        probs = []
-        ctx, page = new_page(browser, 390, 844)
-        page.goto(base, wait_until="load")
-        page.evaluate("window.scrollTo(0, 1500)"); page.wait_for_timeout(300)
-        state = lambda: page.evaluate("""() => { const n = document.querySelector('#nav').getBoundingClientRect();
-            return { open: document.documentElement.classList.contains('nav-open'), expanded: document.querySelector('.nav-toggle').getAttribute('aria-expanded'),
-                     navIn: (() => { const cs = getComputedStyle(document.querySelector('#nav')); return n.left < innerWidth - 10 && n.right <= innerWidth + 1 && cs.visibility === 'visible' && +cs.opacity > 0.5; })(), ofH: getComputedStyle(document.documentElement).overflow,
-                     ofB: getComputedStyle(document.body).overflow, y: scrollY }; }""")
-        page.click(".nav-toggle"); page.wait_for_timeout(700)
-        s1 = state()
-        if not (s1["open"] and s1["expanded"] == "true" and s1["navIn"]): probs.append(f"does not open: {s1}")
-        if not (s1["ofH"] == "hidden" and s1["ofB"] == "hidden"): probs.append(f"scroll not locked: {s1}")
-        page.mouse.wheel(0, 800); page.touchscreen.tap(195, 800) if False else None
-        page.wait_for_timeout(400)
-        if state()["y"] != s1["y"]: probs.append("page scrolled while menu open")
-        if shots: page.screenshot(path=str(Path(shots) / "nav-open-390.png"))
-        page.keyboard.press("Escape"); page.wait_for_timeout(700)
-        s2 = state()
-        if s2["open"] or s2["navIn"] or s2["ofB"] == "hidden": probs.append(f"Escape does not close: {s2}")
-        page.click(".nav-toggle"); page.wait_for_timeout(700)
-        page.click(".main-nav a[href='#contact']"); page.wait_for_timeout(1200)
-        s3 = state()
-        if s3["open"] or s3["navIn"]: probs.append(f"link does not close: {s3}")
-        page.click(".nav-toggle"); page.wait_for_timeout(700)
-        cover = page.evaluate("(() => { const r = document.querySelector('#nav').getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom, innerWidth, innerHeight]; })()")
-        if not (cover[0] <= 0 and cover[1] <= 0 and cover[2] >= cover[4] and cover[3] >= cover[5]): probs.append(f"menu does not cover the screen: {cover}")
-        page.click(".nav-toggle"); page.wait_for_timeout(700)
-        if state()["open"]: probs.append("close button does not close")
-        ctx.close()
-        report("Mobile navigation opens, locks scroll and closes", not probs,
-               "\n".join(probs) or "opens full-screen, locks html+body scroll, closes on Escape, link tap and close button")
-
-        if shots:
-            for w, h in [(1440, 900), (390, 844)]:
-                ctx, page = new_page(browser, w, h)
-                page.goto(base, wait_until="load"); settle(page, 1800)
-                page.screenshot(path=str(Path(shots) / f"full-{w}.png"), full_page=True)
+        for name, url in urls:
+            for w, h in [(1280, 800), (390, 844)]:
+                ctx, page = new_page(browser, w, h, js=False)
+                page.goto(url, wait_until="load")
+                page.wait_for_timeout(1200)   # let entrance animations (e.g. the open FAQ answer) finish
+                r = page.evaluate("""() => {
+                  const vis = (e) => { const cs = getComputedStyle(e), r = e.getBoundingClientRect();
+                                       return cs.display !== 'none' && cs.visibility !== 'hidden' && +cs.opacity > 0.01 && r.width > 0 && r.height > 0; };
+                  const hidden = [...document.querySelectorAll('main *, footer *, header *')].filter(e =>
+                     +getComputedStyle(e).opacity < 0.01 && !e.closest('.to-top') && e.getBoundingClientRect().width > 0).map(e => e.className).slice(0, 5);
+                  const pas = [...document.querySelectorAll('.pa')];
+                  return { htmlClass: document.documentElement.className, pas: pas.length, panels: pas.filter(vis).length,
+                           navLinks: [...document.querySelectorAll('.main-nav > a')].filter(e => vis(e) && e.getBoundingClientRect().left < innerWidth).length,
+                           hidden, overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+                }""")
+                tag = f"{name} {w}px"
+                if r["htmlClass"] != "no-js": probs.append(f"{tag}: html class is '{r['htmlClass']}'")
+                if r["panels"] != r["pas"]: probs.append(f"{tag}: only {r['panels']}/{r['pas']} practice areas visible")
+                if r["navLinks"] != 6: probs.append(f"{tag}: only {r['navLinks']}/6 nav links reachable")
+                if r["hidden"]: probs.append(f"{tag}: invisible content {r['hidden']}")
+                if r["overflow"]: probs.append(f"{tag}: horizontal overflow {r['overflow']}px")
                 ctx.close()
+        report("The page renders fully with JavaScript disabled, on every page", not probs, "\n".join(probs) or f"{len(urls)} pages: all nav links, all practice areas, no hidden content")
+
+        # 11: mobile navigation (on every page)
+        probs = []
+        for name, url in urls:
+            ctx, page = new_page(browser, 390, 844)
+            page.goto(url, wait_until="load")
+            page.evaluate("window.scrollTo(0, 900)"); page.wait_for_timeout(300)
+            state = lambda: page.evaluate("""() => { const n = document.querySelector('#nav'), r = n.getBoundingClientRect(), cs = getComputedStyle(n);
+                return { open: document.documentElement.classList.contains('nav-open'), expanded: document.querySelector('.nav-toggle').getAttribute('aria-expanded'),
+                         shown: cs.visibility === 'visible' && +cs.opacity > 0.5, covers: r.left <= 0 && r.top <= 0 && r.right >= innerWidth && r.bottom >= innerHeight,
+                         ofH: getComputedStyle(document.documentElement).overflow, ofB: getComputedStyle(document.body).overflow, y: scrollY }; }""")
+            page.click(".nav-toggle"); page.wait_for_timeout(700)
+            s1 = state()
+            if not (s1["open"] and s1["expanded"] == "true" and s1["shown"] and s1["covers"]): probs.append(f"{name}: does not open full-screen: {s1}")
+            if not (s1["ofH"] == "hidden" and s1["ofB"] == "hidden"): probs.append(f"{name}: scroll not locked")
+            page.mouse.wheel(0, 800); page.wait_for_timeout(400)
+            if state()["y"] != s1["y"]: probs.append(f"{name}: page scrolled while menu open")
+            if shots and name == "index.html": page.screenshot(path=str(Path(shots) / "nav-open-390.png"))
+            page.keyboard.press("Escape"); page.wait_for_timeout(700)
+            s2 = state()
+            if s2["open"] or s2["shown"] or s2["ofB"] == "hidden": probs.append(f"{name}: Escape does not close")
+            page.click(".nav-toggle"); page.wait_for_timeout(700)
+            page.click(".nav-toggle"); page.wait_for_timeout(700)
+            if state()["open"]: probs.append(f"{name}: close button does not close")
+            ctx.close()
+        report("Mobile navigation opens, locks scroll and closes, on every page", not probs,
+               "\n".join(probs) or f"{len(urls)} pages: full-screen, scroll locked, closes on Escape and close button")
         browser.close()
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://localhost:8080/")
+    ap.add_argument("--serve", action="store_true", help="serve the site from a temporary local server for this run only")
     ap.add_argument("--shots", default="")
     a = ap.parse_args()
     if a.shots: Path(a.shots).mkdir(parents=True, exist_ok=True)
+    server = None
+    if a.serve:
+        import functools, http.server, threading
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args): pass
+        handler = functools.partial(Quiet, directory=str(ROOT))
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        a.base = f"http://127.0.0.1:{server.server_address[1]}/"
     pages = sorted(ROOT.glob("*.html"))
-    static_checks(pages)
-    browser_checks(a.base, a.shots)
+    names = ["index.html"] + [x.name for x in pages if x.name != "index.html"]
+    try:
+        static_checks(pages)
+        browser_checks(a.base, a.shots, names)
+    finally:
+        if server: server.shutdown()
     failed = sum(1 for _, ok in results if not ok)
     print(f"\n{len(results) - failed}/{len(results)} checks passed")
     sys.exit(failed)
